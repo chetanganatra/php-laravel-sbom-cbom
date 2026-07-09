@@ -1,4 +1,4 @@
-# php-laravel-sbom-cbom
+# PHP-Laravel-sbom-cbom
 
 Two small, dependency-free PHP scripts that generate **CycloneDX v1.6** Bills of Materials for PHP / Laravel applications:
 

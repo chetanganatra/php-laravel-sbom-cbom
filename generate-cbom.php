@@ -19,17 +19,19 @@
  * Licensed under the MIT License. See the LICENSE file for details.
  *
  * DISCLAIMER: This tool is provided "as is", without warranty of any kind.
- * Detection is based on regular-expression matching of source code: it can
- * report false positives (e.g. matches inside comments or strings) and miss
- * usage that is constructed dynamically or lives in vendor packages. The
- * security ratings are informational only. This is not a substitute for a
- * professional cryptographic or security audit. See README.md for details.
+ * Detection is based on static analysis of the PHP token stream: comments and
+ * docblocks are ignored, and function-call detection only matches real calls,
+ * but it can still miss usage that is constructed dynamically (variable
+ * functions, call_user_func, string concatenation) or lives in vendor
+ * packages. The security ratings are informational only. This is not a
+ * substitute for a professional cryptographic or security audit. See
+ * README.md for details.
  */
 
 class CryptographicBOMGenerator
 {
     const TOOL_NAME = 'php-laravel-cbom-generator';
-    const TOOL_VERSION = '2.0.0';
+    const TOOL_VERSION = '2.1.0';
 
     private $projectPath;
     private $usedCrypto = [];
@@ -183,26 +185,125 @@ class CryptographicBOMGenerator
             return;
         }
 
-        $this->filesScanned++;
         $location = $this->relativePath($filePath);
 
-        // Laravel facade patterns
-        foreach ($this->laravelCryptoPatterns as $pattern => $details) {
-            $escaped = preg_quote($pattern, '/');
-            if (preg_match_all('/' . $escaped . '\s*\(/', $content, $matches)) {
-                $this->recordCrypto($pattern, $details, count($matches[0]), $location);
-            }
+        try {
+            $tokens = token_get_all($content, TOKEN_PARSE);
+        } catch (Throwable $e) {
+            fwrite(STDERR, "Warning: skipping {$location}: cannot tokenize ({$e->getMessage()})\n");
+            return;
         }
 
-        // PHP crypto functions
-        foreach ($this->cryptoFunctions as $func => $details) {
-            if (preg_match_all('/\b' . $func . '\s*\(/', $content, $matches)) {
-                $this->recordCrypto($func . '()', $details, count($matches[0]), $location);
+        $this->filesScanned++;
+        $this->scanTokens($tokens, $location);
+    }
+
+    /**
+     * Walk the token stream of one file. Comments and docblocks are ignored
+     * entirely; function calls are matched only as real T_STRING calls (bare
+     * or fully qualified, never ->/:: methods); facade usage is matched as
+     * Class::method( via T_DOUBLE_COLON; algorithm names are matched only
+     * against whole string-literal tokens.
+     */
+    private function scanTokens(array $tokens, $location)
+    {
+        $count = count($tokens);
+
+        for ($i = 0; $i < $count; $i++) {
+            $token = $tokens[$i];
+            if (!is_array($token)) {
+                continue;
             }
+
+            list($id, $text, $line) = $token;
+
+            if ($id === T_COMMENT || $id === T_DOC_COMMENT) {
+                continue;
+            }
+
+            // Algorithm names live inside string literals ('sha256', 'aes-256-cbc').
+            if ($id === T_CONSTANT_ENCAPSED_STRING) {
+                $this->matchAlgorithmString(substr($text, 1, -1), $location, $line);
+                continue;
+            }
+
+            $isName = $id === T_STRING
+                || (defined('T_NAME_FULLY_QUALIFIED') && $id === T_NAME_FULLY_QUALIFIED)
+                || (defined('T_NAME_QUALIFIED') && $id === T_NAME_QUALIFIED);
+            if (!$isName) {
+                continue;
+            }
+
+            $nextIdx = $this->significantIndex($tokens, $i, 1);
+            if ($nextIdx === null) {
+                continue;
+            }
+
+            // Laravel facade static call: Class::method( — also matches
+            // \Hash::make( and Illuminate\...\Hash::make( by class basename.
+            if (is_array($tokens[$nextIdx]) && $tokens[$nextIdx][0] === T_DOUBLE_COLON) {
+                $methodIdx = $this->significantIndex($tokens, $nextIdx, 1);
+                if ($methodIdx !== null && is_array($tokens[$methodIdx]) && $tokens[$methodIdx][0] === T_STRING) {
+                    $parenIdx = $this->significantIndex($tokens, $methodIdx, 1);
+                    if ($parenIdx !== null && $tokens[$parenIdx] === '(') {
+                        $pos = strrpos($text, '\\');
+                        $class = $pos === false ? $text : substr($text, $pos + 1);
+                        $key = $class . '::' . $tokens[$methodIdx][1];
+                        if (isset($this->laravelCryptoPatterns[$key])) {
+                            $this->recordCrypto($key, $this->laravelCryptoPatterns[$key], $location, $line);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Bare (or fully qualified) function call: name must be directly
+            // followed by "(". Namespaced functions (Foo\hash) are a different
+            // function and are not counted.
+            if ($tokens[$nextIdx] !== '(') {
+                continue;
+            }
+
+            $name = strtolower(ltrim($text, '\\'));
+            if (strpos($name, '\\') !== false || !isset($this->cryptoFunctions[$name])) {
+                continue;
+            }
+
+            $prevIdx = $this->significantIndex($tokens, $i, -1);
+            if ($prevIdx !== null) {
+                $prev = $tokens[$prevIdx];
+                $prevId = is_array($prev) ? $prev[0] : null;
+                if ($prevId === T_OBJECT_OPERATOR
+                    || $prevId === T_DOUBLE_COLON
+                    || $prevId === T_FUNCTION
+                    || $prevId === T_NEW
+                    || (defined('T_NULLSAFE_OBJECT_OPERATOR') && $prevId === T_NULLSAFE_OBJECT_OPERATOR)) {
+                    continue;
+                }
+            }
+
+            $this->recordCrypto($name . '()', $this->cryptoFunctions[$name], $location, $line);
+        }
+    }
+
+    /**
+     * Index of the nearest non-whitespace, non-comment token from $index in
+     * $direction (1 or -1), or null if none.
+     */
+    private function significantIndex(array $tokens, $index, $direction)
+    {
+        $count = count($tokens);
+
+        for ($i = $index + $direction; $i >= 0 && $i < $count; $i += $direction) {
+            $token = $tokens[$i];
+            if (is_array($token) && in_array($token[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) {
+                continue;
+            }
+
+            return $i;
         }
 
-        $this->extractCiphers($content, $location);
-        $this->extractHashAlgorithms($content, $location);
+        return null;
     }
 
     private function relativePath($filePath)
@@ -217,44 +318,37 @@ class CryptographicBOMGenerator
     }
 
     /**
-     * Extract quoted cipher specifications like 'aes-256-gcm' or 'AES-128-CBC'.
+     * Match one string-literal value against the known cipher specifications
+     * ('aes-256-gcm', 'des-ede3-cbc', ...) and hash-algorithm names. The whole
+     * literal must be the algorithm name, matching case-insensitively.
      */
-    private function extractCiphers($content, $location)
+    private function matchAlgorithmString($value, $location, $line)
     {
-        if (preg_match_all('/["\'](aes-(?:128|192|256)-(?:cbc|gcm|ecb|ctr|cfb|ofb))["\']/i', $content, $matches)) {
-            foreach ($matches[1] as $cipher) {
-                $cipher = strtoupper($cipher);
-                $mode = substr($cipher, strrpos($cipher, '-') + 1);
-                $security = $mode === 'ECB' ? 'weak' : ($mode === 'GCM' ? 'strong' : 'standard');
-                $this->recordAlgorithm($cipher, 'Cipher', $security, 1, $location);
-            }
+        if (preg_match('/^aes-(?:128|192|256)-(?:cbc|gcm|ecb|ctr|cfb|ofb)$/i', $value)) {
+            $cipher = strtoupper($value);
+            $mode = substr($cipher, strrpos($cipher, '-') + 1);
+            $security = $mode === 'ECB' ? 'weak' : ($mode === 'GCM' ? 'strong' : 'standard');
+            $this->recordAlgorithm($cipher, 'Cipher', $security, $location, $line);
+            return;
         }
 
         // DES / 3DES (deprecated)
-        if (preg_match_all('/["\'](des-ede3(?:-cbc|-ecb)?|des-(?:cbc|ecb))["\']/i', $content, $matches)) {
-            foreach ($matches[1] as $cipher) {
-                $this->recordAlgorithm(strtoupper($cipher), 'Cipher', 'deprecated', 1, $location);
-            }
+        if (preg_match('/^(?:des-ede3(?:-cbc|-ecb)?|des-(?:cbc|ecb))$/i', $value)) {
+            $this->recordAlgorithm(strtoupper($value), 'Cipher', 'deprecated', $location, $line);
+            return;
+        }
+
+        $lower = strtolower($value);
+        if (isset($this->hashAlgorithmStrings[$lower])) {
+            $details = $this->hashAlgorithmStrings[$lower];
+            $this->recordAlgorithm($details['name'], 'Hash Algorithm', $details['security'], $location, $line);
         }
     }
 
     /**
-     * Extract quoted hash-algorithm names.
+     * Record one detected usage of a crypto function or facade call.
      */
-    private function extractHashAlgorithms($content, $location)
-    {
-        foreach ($this->hashAlgorithmStrings as $pattern => $details) {
-            $escaped = preg_quote($pattern, '/');
-            if (preg_match_all('/(["\'])' . $escaped . '\1/i', $content, $matches)) {
-                $this->recordAlgorithm($details['name'], 'Hash Algorithm', $details['security'], count($matches[0]), $location);
-            }
-        }
-    }
-
-    /**
-     * Record usage of a crypto function or facade call.
-     */
-    private function recordCrypto($name, $details, $count, $location)
+    private function recordCrypto($name, $details, $location, $line)
     {
         $key = $details['algorithm'] . ' (' . $details['category'] . ')';
 
@@ -268,35 +362,35 @@ class CryptographicBOMGenerator
                 'primitive' => $details['primitive'],
                 'cryptoFunctions' => [],
                 'occurrences' => 0,
-                'locations' => [],
+                'sites' => [],
             ];
         }
 
         $entry = &$this->usedCrypto[$key];
         $entry['functions'][$name] = true;
         $entry['cryptoFunctions'] = array_values(array_unique(array_merge($entry['cryptoFunctions'], $details['cryptoFunctions'])));
-        $entry['occurrences'] += $count;
-        $entry['locations'][$location] = (isset($entry['locations'][$location]) ? $entry['locations'][$location] : 0) + $count;
+        $entry['occurrences']++;
+        $entry['sites'][$location . ':' . $line] = ['location' => $location, 'line' => $line];
         unset($entry);
     }
 
     /**
-     * Record a named algorithm found as a string literal.
+     * Record one detected occurrence of a named algorithm string literal.
      */
-    private function recordAlgorithm($name, $type, $security, $count, $location)
+    private function recordAlgorithm($name, $type, $security, $location, $line)
     {
         if (!isset($this->detectedAlgorithms[$name])) {
             $this->detectedAlgorithms[$name] = [
                 'type' => $type,
                 'security' => $security,
                 'count' => 0,
-                'locations' => [],
+                'sites' => [],
             ];
         }
 
         $entry = &$this->detectedAlgorithms[$name];
-        $entry['count'] += $count;
-        $entry['locations'][$location] = (isset($entry['locations'][$location]) ? $entry['locations'][$location] : 0) + $count;
+        $entry['count']++;
+        $entry['sites'][$location . ':' . $line] = ['location' => $location, 'line' => $line];
         unset($entry);
     }
 
@@ -339,14 +433,27 @@ class CryptographicBOMGenerator
         return 'crypto/' . $prefix . '/' . trim($slug, '-');
     }
 
-    private function occurrenceEvidence(array $locations)
+    private function occurrenceEvidence(array $sites)
     {
         $occurrences = [];
-        foreach (array_keys($locations) as $location) {
-            $occurrences[] = ['location' => $location];
+        foreach ($sites as $site) {
+            $occurrences[] = ['location' => $site['location'], 'line' => $site['line']];
         }
 
         return ['occurrences' => $occurrences];
+    }
+
+    /**
+     * Unique file paths from a list of detection sites.
+     */
+    private function siteFiles(array $sites)
+    {
+        $files = [];
+        foreach ($sites as $site) {
+            $files[$site['location']] = true;
+        }
+
+        return array_keys($files);
     }
 
     /**
@@ -385,7 +492,7 @@ class CryptographicBOMGenerator
                         'cryptoFunctions' => $details['cryptoFunctions'],
                     ],
                 ],
-                'evidence' => $this->occurrenceEvidence($details['locations']),
+                'evidence' => $this->occurrenceEvidence($details['sites']),
                 'properties' => [
                     ['name' => 'cbom:category', 'value' => $details['category']],
                     ['name' => 'cbom:security-rating', 'value' => $details['security']],
@@ -405,7 +512,7 @@ class CryptographicBOMGenerator
                     'assetType' => 'algorithm',
                     'algorithmProperties' => $this->algorithmProperties($name, $details['type']),
                 ],
-                'evidence' => $this->occurrenceEvidence($details['locations']),
+                'evidence' => $this->occurrenceEvidence($details['sites']),
                 'properties' => [
                     ['name' => 'cbom:category', 'value' => $details['type']],
                     ['name' => 'cbom:security-rating', 'value' => $details['security']],
@@ -468,7 +575,7 @@ class CryptographicBOMGenerator
                 $output .= "  Library: {$details['library']}\n";
                 $output .= "  Security: {$details['security']}\n";
                 $output .= "  Occurrences: {$details['occurrences']}\n";
-                $output .= '  Files: ' . implode(', ', array_keys($details['locations'])) . "\n";
+                $output .= '  Files: ' . implode(', ', $this->siteFiles($details['sites'])) . "\n";
             }
         }
 
@@ -482,7 +589,7 @@ class CryptographicBOMGenerator
                 $output .= "\n{$algo} ({$details['type']})\n";
                 $output .= "  Security: {$details['security']}\n";
                 $output .= "  Usage Count: {$details['count']}\n";
-                $output .= '  Files: ' . implode(', ', array_keys($details['locations'])) . "\n";
+                $output .= '  Files: ' . implode(', ', $this->siteFiles($details['sites'])) . "\n";
             }
         }
 

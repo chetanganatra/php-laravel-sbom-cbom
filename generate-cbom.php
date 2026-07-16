@@ -30,7 +30,7 @@
 
 class CryptographicBOMGenerator
 {
-    const TOOL_NAME = 'php-laravel-cbom-generator';
+    const TOOL_NAME = 'ais-php-laravel-cbom-generator';
     const TOOL_VERSION = '2.1.0';
 
     private $projectPath;
